@@ -1,0 +1,19 @@
+{
+  "bot_name": "MyBot",
+  "chat_id": "oc_xxx_your_chat_id",
+  "keywords": ["MyBot", "@MyBot"],
+  "self_names": ["MyBot"],
+  "self_ids": ["cli_xxx_your_app_id"],
+  "poll_interval_seconds": 10,
+  "page_size": 20,
+  "model": "sonnet",
+  "working_dir": "/path/to/your/working/directory",
+  "lark_cli_path": "/path/to/lark-cli",
+  "claude_cli_path": "/path/to/claude",
+  "member_map": {
+    "ou_xxx_user_open_id": "张三",
+    "cli_xxx_other_bot_id": "OtherBot",
+    "cli_xxx_your_app_id": "MyBot"
+  },
+  "identity_prompt": "你是MyBot，飞书群里的值班机器人。\n\n核心规则：\n1. 直接输出回复内容，系统会自动发送\n2. 不确定的事不要猜，不知道就说不知道\n3. 回复简洁自然"
+}

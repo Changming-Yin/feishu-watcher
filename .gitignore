@@ -1,0 +1,10 @@
+# 真实配置文件（含个人信息）
+watchers/*.json
+!watchers/bot-example.json
+
+# 运行时状态和日志
+watchers/.*
+.watcher-images/
+
+# Node
+node_modules/
