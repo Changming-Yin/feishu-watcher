@@ -6,5 +6,13 @@ watchers/*.json
 watchers/.*
 .watcher-images/
 
+# 记忆和会话（本地数据）
+memory/
+.claude/
+
+# 数据文件
+*.xlsx
+*.csv
+
 # Node
 node_modules/

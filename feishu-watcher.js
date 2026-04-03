@@ -196,22 +196,29 @@ function isSelfMessage(msg) {
   return senderType === 'app' && senderName && SELF_NAMES.some(n => senderName.includes(n));
 }
 
-// ========== Bot连续对话限流 ==========
-const BOT_LOOP_LIMIT = 5;
+// ========== Bot连续对话限流（时间窗口模式） ==========
+const BOT_LOOP_LIMIT = 8;           // 时间窗口内最大bot回复轮数
+const BOT_LOOP_WINDOW_MS = 5 * 60 * 1000; // 5分钟窗口
+
+// 记录自己回复bot消息的时间戳
+const botReplyTimestamps = [];
 
 function isBotLooping(msg, allMessages) {
   const senderType = msg.sender?.sender_type || '';
   if (senderType !== 'app') return false;
 
-  const idx = allMessages.findIndex(m => m.message_id === msg.message_id);
-  if (idx < 0) return false;
-
-  let botStreak = 0;
-  for (let i = idx - 1; i >= 0 && i >= idx - BOT_LOOP_LIMIT; i--) {
-    if (allMessages[i].sender?.sender_type === 'app') botStreak++;
-    else break;
+  const now = Date.now();
+  // 清理窗口外的旧记录
+  while (botReplyTimestamps.length > 0 && (now - botReplyTimestamps[0]) > BOT_LOOP_WINDOW_MS) {
+    botReplyTimestamps.shift();
   }
-  return botStreak >= BOT_LOOP_LIMIT;
+  // 检查窗口内是否超限
+  if (botReplyTimestamps.length >= BOT_LOOP_LIMIT) {
+    return true;
+  }
+  // 记录这次
+  botReplyTimestamps.push(now);
+  return false;
 }
 
 // ========== 构建上下文字符串 ==========
@@ -235,14 +242,73 @@ function buildContext(allMessages, currentMsgId, count) {
   return `\n\n--- 最近的对话上下文（共${lines.length}条） ---\n${lines.join('\n')}\n--- 上下文结束 ---`;
 }
 
+// ========== 记忆系统 ==========
+
+function loadMemory() {
+  const memoryDir = path.join(WORKING_DIR, 'memory');
+  if (!fs.existsSync(memoryDir)) return '';
+
+  const parts = [];
+
+  // 递归读取 memory/ 下所有 .md 文件（包括子目录如 facts/）
+  function readDir(dir, prefix) {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        readDir(fullPath, prefix ? `${prefix}/${entry.name}` : entry.name);
+      } else if (entry.name.endsWith('.md')) {
+        try {
+          const content = fs.readFileSync(fullPath, 'utf8').trim();
+          if (content) {
+            const label = prefix ? `[${prefix}/${entry.name}]` : `[${entry.name}]`;
+            const isFact = (prefix || '').includes('facts');
+            parts.push(`${isFact ? '【已确认事实】' : ''}${label}\n${content}`);
+          }
+        } catch {}
+      }
+    }
+  }
+
+  readDir(memoryDir, '');
+  if (parts.length === 0) return '';
+  return `\n\n--- 你的长期记忆（共${parts.length}条，请基于这些信息回复） ---\n${parts.join('\n\n')}\n--- 长期记忆结束 ---`;
+}
+
+// ========== 会话ID管理 ==========
+// 使用固定UUID作为session-id，确保所有对话在同一会话中延续
+
+const crypto = require('crypto');
+const SESSION_ID_FILE = path.join(SESSION_DIR, '.claude-session-id');
+
+function getOrCreateSessionId() {
+  try {
+    const id = fs.readFileSync(SESSION_ID_FILE, 'utf8').trim();
+    if (id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
+      return id;
+    }
+  } catch {}
+  // 生成新的UUID并持久化
+  const newId = crypto.randomUUID();
+  fs.writeFileSync(SESSION_ID_FILE, newId, 'utf8');
+  log(`生成新会话ID: ${newId}`);
+  return newId;
+}
+
+const CLAUDE_SESSION_ID = getOrCreateSessionId();
+
 // ========== Claude会话处理 ==========
 
 function handleWithClaude(senderName, text, messageId, imagePath, contextStr) {
   const today = new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
 
+  // 加载长期记忆
+  const memoryStr = loadMemory();
+
   const prompt = `${IDENTITY_PROMPT}
 
 现在是 ${today}。
+${memoryStr}
 ${contextStr}
 飞书群里有人发了一条消息：
 发送人：${senderName}
@@ -255,6 +321,8 @@ ${contextStr}
 2. 如果与你无关或不需要回复，只输出"[跳过]"
 3. 只输出一段回复内容，不要输出多段、不要输出思考过程
 4. 回复要简洁自然
+5. 如果从对话中获得了重要的新知识、事实或经验，用Write工具写入 ${WORKING_DIR.replace(/\\/g, '/')}/memory/ 目录（已确认的客观事实放 memory/facts/ 子目录）。文件名用简短中文描述，.md格式。这是你的长期记忆，下次醒来会自动加载。
+6. 不要重复写入已有的记忆内容，先检查记忆中是否已经有了
 
 ${imagePath ? `这条消息附带了一张图片，已下载到本地：${imagePath.replace(/\\/g, '/')}
 请用Read工具读取这个图片文件来查看内容，然后基于图片内容回复。` : ''}
@@ -267,7 +335,8 @@ ${imagePath ? `这条消息附带了一张图片，已下载到本地：${imageP
     fs.writeFileSync(tmpFile, prompt, 'utf8');
     const tmpPath = tmpFile.replace(/\\/g, '/');
 
-    const response = execSync(`cat "${tmpPath}" | "${CLAUDE_CLI}" -p --continue --dangerously-skip-permissions --model ${MODEL}`, {
+    // 使用固定 session-id 确保会话延续，Claude 会在同一会话中积累上下文
+    const response = execSync(`cat "${tmpPath}" | "${CLAUDE_CLI}" -p --session-id "${CLAUDE_SESSION_ID}" --dangerously-skip-permissions --model ${MODEL}`, {
       encoding: 'utf8',
       timeout: 300000,
       shell: 'bash',
@@ -414,7 +483,12 @@ log(`群: ${CHAT_ID}`);
 log(`关键词: ${KEYWORDS.join(', ')}`);
 log(`模型: ${MODEL}`);
 log(`会话目录: ${SESSION_DIR}`);
+log(`会话ID: ${CLAUDE_SESSION_ID}`);
 log(`轮询间隔: ${POLL_INTERVAL / 1000}秒`);
+log(`防循环: ${BOT_LOOP_WINDOW_MS / 1000}秒窗口内最多${BOT_LOOP_LIMIT}轮bot对话`);
+// 加载一次记忆看看有多少条
+const bootMemory = loadMemory();
+log(`长期记忆: ${bootMemory ? '已加载' : '空'}`);
 log('========================================');
 
 // 使用 setTimeout 递归代替 setInterval，防止 Claude 处理耗时导致轮询堆积
