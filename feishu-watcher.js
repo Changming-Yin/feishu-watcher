@@ -37,13 +37,15 @@ if (!fs.existsSync(SESSION_DIR)) fs.mkdirSync(SESSION_DIR, { recursive: true });
 
 // ========== 配置热更新 ==========
 
-let CHAT_ID, BOT_NAME, SELF_NAMES, SELF_IDS, KEYWORDS, POLL_INTERVAL, PAGE_SIZE;
+let CHAT_ID, USER_ID, DM_MODE, BOT_NAME, SELF_NAMES, SELF_IDS, KEYWORDS, POLL_INTERVAL, PAGE_SIZE;
 let MODEL, IDENTITY_PROMPT;
 let WORKING_DIR, LARK_CLI, CLAUDE_CLI, MEMBER_MAP;
 
 function loadConfig() {
   const config = JSON.parse(fs.readFileSync(configFile, 'utf8'));
   CHAT_ID = config.chat_id;
+  USER_ID = config.user_id || null;
+  DM_MODE = !!USER_ID && !CHAT_ID;  // 私信模式：有 user_id 无 chat_id
   BOT_NAME = config.bot_name || '值班机器人';
   SELF_NAMES = config.self_names || [BOT_NAME];
   SELF_IDS = new Set(config.self_ids || []);
@@ -297,6 +299,82 @@ function getOrCreateSessionId() {
 
 const CLAUDE_SESSION_ID = getOrCreateSessionId();
 
+// ========== 记忆提取（强制后处理） ==========
+
+function extractMemory(senderName, text, replyText, contextStr) {
+  const memoryDir = path.join(WORKING_DIR, 'memory');
+  const factsDir = path.join(memoryDir, 'facts');
+  const peopleDir = path.join(memoryDir, 'people');
+  const decisionsDir = path.join(memoryDir, 'decisions');
+  const learningsDir = path.join(memoryDir, 'learnings');
+
+  [memoryDir, factsDir, peopleDir, decisionsDir, learningsDir].forEach(d => {
+    if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
+  });
+
+  // 加载现有记忆文件名列表，供去重
+  let existingFiles = [];
+  try {
+    const listFiles = (dir) => {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.isDirectory()) listFiles(path.join(dir, e.name));
+        else if (e.name.endsWith('.md')) existingFiles.push(e.name);
+      }
+    };
+    listFiles(memoryDir);
+  } catch {}
+
+  const extractPrompt = `你是一个记忆提取器。你的任务是从以下对话中提取值得长期记住的信息。
+
+对话上下文：
+${contextStr}
+
+新消息：
+发送人：${senderName}
+内容：${text}
+
+我的回复：${replyText || '（未回复）'}
+
+已有的记忆文件：${existingFiles.join(', ') || '（空）'}
+
+请判断这段对话中是否包含以下任何一类值得记住的新信息：
+1. **facts/** — 客观事实：确认的数据、架构信息、产品功能、团队分工等
+2. **people/** — 人物洞察：某人的偏好、习惯、职责、说话风格、关心的事
+3. **decisions/** — 决策记录：团队做出的决定、达成的共识、确认的流程
+4. **learnings/** — 经验教训：从错误中学到的、从反馈中理解的、能力边界的认知
+
+规则：
+- 如果没有值得记住的新信息，只输出"[无新记忆]"
+- 如果有，用Write工具写入对应的子目录，文件名用简短中文描述.md
+- 不要重复已有记忆文件中可能已经有的内容
+- 每条记忆文件控制在10行以内，精炼有用
+- 只提取事实和洞察，不要记录闲聊
+
+工作目录：${WORKING_DIR.replace(/\\/g, '/')}`;
+
+  try {
+    const tmpFile = path.join(os.tmpdir(), `${configName}-memory.txt`);
+    fs.writeFileSync(tmpFile, extractPrompt, 'utf8');
+    const tmpPath = tmpFile.replace(/\\/g, '/');
+
+    const result = execSync(`cat "${tmpPath}" | "${CLAUDE_CLI}" -p --dangerously-skip-permissions --model sonnet`, {
+      encoding: 'utf8',
+      timeout: 60000,
+      shell: 'bash',
+      cwd: WORKING_DIR
+    });
+
+    if (result.includes('[无新记忆]')) {
+      log(`→ 记忆提取：无新信息`);
+    } else {
+      log(`→ 记忆提取完成: ${result.trim().substring(0, 80)}...`);
+    }
+  } catch (e) {
+    log(`记忆提取异常（不影响主流程）: ${e.message.substring(0, 100)}`);
+  }
+}
+
 // ========== Claude会话处理 ==========
 
 function handleWithClaude(senderName, text, messageId, imagePath, contextStr) {
@@ -321,8 +399,6 @@ ${contextStr}
 2. 如果与你无关或不需要回复，只输出"[跳过]"
 3. 只输出一段回复内容，不要输出多段、不要输出思考过程
 4. 回复要简洁自然
-5. 如果从对话中获得了重要的新知识、事实或经验，用Write工具写入 ${WORKING_DIR.replace(/\\/g, '/')}/memory/ 目录（已确认的客观事实放 memory/facts/ 子目录）。文件名用简短中文描述，.md格式。这是你的长期记忆，下次醒来会自动加载。
-6. 不要重复写入已有的记忆内容，先检查记忆中是否已经有了
 
 ${imagePath ? `这条消息附带了一张图片，已下载到本地：${imagePath.replace(/\\/g, '/')}
 请用Read工具读取这个图片文件来查看内容，然后基于图片内容回复。` : ''}
@@ -335,8 +411,7 @@ ${imagePath ? `这条消息附带了一张图片，已下载到本地：${imageP
     fs.writeFileSync(tmpFile, prompt, 'utf8');
     const tmpPath = tmpFile.replace(/\\/g, '/');
 
-    // 使用固定 session-id 确保会话延续，Claude 会在同一会话中积累上下文
-    const response = execSync(`cat "${tmpPath}" | "${CLAUDE_CLI}" -p --session-id "${CLAUDE_SESSION_ID}" --dangerously-skip-permissions --model ${MODEL}`, {
+    const response = execSync(`cat "${tmpPath}" | "${CLAUDE_CLI}" -p --continue --dangerously-skip-permissions --model ${MODEL}`, {
       encoding: 'utf8',
       timeout: 300000,
       shell: 'bash',
@@ -345,14 +420,21 @@ ${imagePath ? `这条消息附带了一张图片，已下载到本地：${imageP
 
     const output = response.trim();
 
-    if (output.includes('[跳过]')) {
+    const skipped = output.includes('[跳过]');
+
+    if (skipped) {
       log(`→ Claude判断不需要回复`);
-      return;
+    } else {
+      log(`→ Claude处理完成: ${output.substring(0, 100)}...`);
+      log(`→ 发送回复`);
+      larkCliReply(messageId, output);
     }
 
-    log(`→ Claude处理完成: ${output.substring(0, 100)}...`);
-    log(`→ 发送回复`);
-    larkCliReply(messageId, output);
+    // 记忆提取：实际回复了才提取。跳过的消息不浪费调用。
+    if (!skipped) {
+      extractMemory(senderName, text, output, contextStr);
+    }
+
   } catch (e) {
     log(`Claude会话异常: ${e.message.substring(0, 200)}`);
   }
@@ -374,7 +456,8 @@ function processOneMessage(msg, allMessages) {
   const senderType = msg.sender?.sender_type || '';
   const isBotMsg = senderType === 'app' && !isSelfMessage(msg);
 
-  if (!keywordHit && !replyHit && !isBotMsg) {
+  // 私信模式：所有消息都触发，不需要关键词
+  if (!DM_MODE && !keywordHit && !replyHit && !isBotMsg) {
     log(`→ 未触发，跳过`);
     return;
   }
@@ -418,7 +501,11 @@ function poll() {
 
   const state = loadState();
 
-  const result = larkCli('im', '+chat-messages-list', '--chat-id', CHAT_ID, '--as', 'bot', '--page-size', String(PAGE_SIZE));
+  // 支持群聊和私信两种模式
+  const fetchArgs = DM_MODE
+    ? ['im', '+chat-messages-list', '--user-id', USER_ID, '--as', 'bot', '--page-size', String(PAGE_SIZE)]
+    : ['im', '+chat-messages-list', '--chat-id', CHAT_ID, '--as', 'bot', '--page-size', String(PAGE_SIZE)];
+  const result = larkCli(...fetchArgs);
   if (!result.ok) {
     const errStr = JSON.stringify(result).substring(0, 300);
     log(`拉取消息失败: ${errStr}`);
@@ -479,7 +566,8 @@ function poll() {
 // ========== 启动 ==========
 log('========================================');
 log(`${BOT_NAME} 值班监控启动`);
-log(`群: ${CHAT_ID}`);
+log(`模式: ${DM_MODE ? '私信' : '群聊'}`);
+log(`目标: ${DM_MODE ? USER_ID : CHAT_ID}`);
 log(`关键词: ${KEYWORDS.join(', ')}`);
 log(`模型: ${MODEL}`);
 log(`会话目录: ${SESSION_DIR}`);

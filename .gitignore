@@ -10,6 +10,9 @@ watchers/.*
 memory/
 .claude/
 
+# 内部文档（含敏感信息）
+docs/
+
 # 数据文件
 *.xlsx
 *.csv
